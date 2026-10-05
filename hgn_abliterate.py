@@ -875,12 +875,15 @@ def abliterate(in_path, out_path, direction, alpha=1.0, layer_spec=None,
     payload_start = pad(HEADER_SIZE + ENTRY_SIZE * n, 64)
     out = open(out_path, "wb")
     out.truncate(payload_start)  # header+table rewritten at the end
-    out.seek(payload_start)
     new_checksums = []
     new_offsets = []
     off = payload_start
     for e in hgn.entries:
         new_offsets.append(off)
+        # seek to the aligned offset: tensors are spaced by pad(size, 64),
+        # so any size that is not a multiple of 64 leaves a gap that must
+        # NOT be skipped by sequential writes (the table points here)
+        out.seek(off)
         if e.name not in target_names:
             view = hgn.payload(e)
             write_copy(out, view)

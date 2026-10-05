@@ -56,6 +56,8 @@ def build_file(path, tensors, identity):
         off = ps
         for name, store, variant, shape, blob in tensors:
             offs.append(off)
+            f.seek(off)  # payloads sit at 64-byte-aligned offsets; gaps are
+                         # real holes in the file, not skipped by writes
             f.write(blob)
             cks.append(ha.xor_fold_bytes(blob))
             off += ha.pad(len(blob), 64)
@@ -163,6 +165,13 @@ def main():
 
     tensors = [
         ("lm_head.weight", 5, 2, [64, D], q4c_payload(lm, cb)),
+        # 96-byte pass-through tensor: NOT a multiple of 64, so every payload
+        # after it sits behind a padding gap. Regression test for the writer
+        # bug where sequential writes ignored the pad(size, 64) gaps and
+        # shifted all later tensors off their table offsets.
+        ("layers.0.linear_attn.A_log", 0, 0, [48],
+         RNG.standard_normal(48).astype(np.float32).astype(
+             np.float16).tobytes()),
         ("embed_tokens.weight", 5, 2, [128, D], q4c_payload(embed, cb)),
         ("layers.0.linear_attn.in_proj_qkv.weight", 5, 2, [256, D],
          q4c_payload(inproj, cb)),
@@ -209,6 +218,7 @@ def main():
     # 3. pass-through byte-identical
     hb = ha.HgnFile(base)
     for name in ("embed_tokens.weight",
+                 "layers.0.linear_attn.A_log",
                  "layers.0.mlp.experts.down_proj.weight",
                  "layers.1.ple.ple_embedding.layer_multipliers"):
         a = bytes(hb.payload(hb.by_name[name]))
