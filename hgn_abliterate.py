@@ -648,48 +648,92 @@ class AffineCodec:
 
 
 class HTCodec:
-    """HT (store 16, variant 0x1208): cyclic scalar trellis + H128 rotations.
+    """HT (store 16, variants 0x1208/4-bit and 0x1206/3-bit): cyclic scalar
+    trellis + H128 rotations.
 
-    Needs side planes from the tensor's .suh/.svh siblings: su (K,) of +/-1
-    signs and sv (N,) signed row scales. Row rotations couple blocks of 128
-    rows, so decode expands row ranges to 128 boundaries and encode requires
-    128-aligned chunks. Encoding uses the native Viterbi encoder
-    (ht_trellis.so, built from ht_trellis.cpp).
+    Side planes come from the tensor's .suh/.svh siblings: su (K,) of +/-1
+    signs and sv (N,) signed row scales. Fused rank-3 expert tensors instead
+    carry per-expert planes: su (E, K) and sv (E, O) with N = E*O; their rows
+    are processed expert-by-expert with that expert's planes. Row rotations
+    couple blocks of 128 rows, so decode expands row ranges to 128 boundaries
+    and encode requires 128-aligned chunks (expert-aligned for rank-3).
+    Encoding uses the native Viterbi encoder (ht_trellis.so).
     """
 
-    def __init__(self, payload, N, K, su, sv, workers=8, beam=128):
-        if N % 128 or K % 128:
-            raise ValueError("HT requires N and K divisible by 128")
-        if len(payload) != N * K // 2:
-            raise ValueError("HT payload size mismatch")
+    def __init__(self, payload, N, K, su, sv, workers=8, beam=128, bits=4):
+        self.bits = bits
         self.payload = payload
         self.N, self.K = N, K
-        self.su = np.ascontiguousarray(su, np.float32)
-        self.sv = np.ascontiguousarray(sv, np.float32)
         self.workers, self.beam = workers, beam
         self.out = bytearray()
+        su = np.ascontiguousarray(su, np.float32)
+        sv = np.ascontiguousarray(sv, np.float32)
+        if su.ndim == 2:
+            self.E, self.O = su.shape[0], sv.shape[1]
+            if self.E * self.O != N or su.shape[1] != K:
+                raise ValueError("HT per-expert plane shape mismatch")
+            if self.O % 128 or K % 128:
+                raise ValueError("HT requires O and K divisible by 128")
+            self.per_expert = True
+        else:
+            if N % 128 or K % 128:
+                raise ValueError("HT requires N and K divisible by 128")
+            self.per_expert = False
+        self.su, self.sv = su, sv
+        if len(payload) != N * K * bits // 8:
+            raise ValueError("HT payload size mismatch")
+
+    def _slice(self, a, b):
+        return bytes(self.payload[a * self.K * self.bits // 8:
+                                  b * self.K * self.bits // 8])
 
     def decode_rows(self, a, b):
-        K = self.K
-        first = a // 128 * 128
-        last = (b + 127) // 128 * 128
-        seg = bytes(self.payload[first * K // 2: last * K // 2])
-        dec = hgnht.decode(seg, (last - first, K), self.su, self.sv[first:last])
-        return np.ascontiguousarray(dec[a - first:b - first])
+        if not self.per_expert:
+            first = a // 128 * 128
+            last = (b + 127) // 128 * 128
+            dec = hgnht.decode(self._slice(first, last),
+                               (last - first, self.K), self.su,
+                               self.sv[first:last], self.bits)
+            return np.ascontiguousarray(dec[a - first:b - first])
+        parts = []
+        for e in range(a // self.O, (b + self.O - 1) // self.O):
+            lo, hi = max(a, e * self.O), min(b, (e + 1) * self.O)
+            first = (lo - e * self.O) // 128 * 128 + e * self.O
+            last = (hi - e * self.O + 127) // 128 * 128 + e * self.O
+            dec = hgnht.decode(self._slice(first, last), (last - first,
+                               self.K), self.su[e],
+                               self.sv[e][first - e * self.O:
+                                          last - e * self.O], self.bits)
+            parts.append(dec[lo - first:hi - first])
+        return np.ascontiguousarray(np.concatenate(parts))
 
-    def encode_rows(self, a, b, w):
-        if a % 128 or b % 128:
-            raise ValueError("HT encode requires 128-aligned row chunks "
-                             "(use a --chunk-rows that is a multiple of 128)")
-        rot = hgnht.rotate(np.ascontiguousarray(w, np.float32),
-                           self.su, self.sv[a:b])
+    def _rotate(self, w, su, sv):
+        rot = hgnht.rotate(np.ascontiguousarray(w, np.float32), su, sv)
         if not np.all(np.isfinite(rot)):
             bad = int(np.isnan(rot).sum() + np.isinf(rot).sum())
             raise ValueError(
-                f"HT encode: {bad} non-finite rotated values in rows "
-                f"{a}:{b} — the input weights or direction vector contain "
-                f"NaN/inf")
-        self.out += hgnht.encode_rot(rot, self.workers, self.beam)
+                f"HT encode: {bad} non-finite rotated values — the input "
+                f"weights or direction vector contain NaN/inf")
+        return rot
+
+    def encode_rows(self, a, b, w):
+        if self.per_expert:
+            if a % self.O or b % self.O:
+                raise ValueError("HT fused experts encode requires "
+                                 f"expert-aligned chunks ({self.O} rows)")
+            for e in range(a // self.O, b // self.O):
+                rot = self._rotate(w[(e * self.O - a):(e + 1) * self.O - a],
+                                   self.su[e], self.sv[e])
+                self.out += hgnht.encode_rot(rot, self.workers, self.beam,
+                                             self.bits)
+        else:
+            if a % 128 or b % 128:
+                raise ValueError("HT encode requires 128-aligned row chunks "
+                                 "(use a --chunk-rows that is a multiple "
+                                 "of 128)")
+            rot = self._rotate(w, self.su, self.sv[a:b])
+            self.out += hgnht.encode_rot(rot, self.workers, self.beam,
+                                         self.bits)
 
     def finalize(self):
         return bytes(self.out)
@@ -705,6 +749,10 @@ def ht_sides(hgn, entry):
                          f"{root}.suh/.svh")
     su = np.frombuffer(bytes(hgn.payload(su_e)), "<f2").astype(np.float32)
     sv = np.frombuffer(bytes(hgn.payload(sv_e)), "<f2").astype(np.float32)
+    if entry.rank == 3:
+        # fused experts carry per-expert planes: suh [E, K], svh [E, O]
+        su = su.reshape(entry.shape[0], entry.K)
+        sv = sv.reshape(entry.shape[0], entry.shape[1])
     return su, sv
 
 
@@ -727,12 +775,13 @@ def make_codec(store, variant, payload, N, K, su=None, sv=None):
         if hgnht is None:
             raise ValueError("store 16 (HT) needs hgnht.py/hgnenc.py next to "
                              "this script")
-        if variant != 0x1208:
+        if variant not in (0x1208, 0x1206):
             raise ValueError(f"HT variant 0x{variant:04x} not editable "
-                             f"(only 0x1208 / 4-bit)")
+                             f"(only 0x1208 / 4-bit and 0x1206 / 3-bit)")
         if su is None or sv is None:
             raise ValueError("HT needs its .suh/.svh side planes")
-        return HTCodec(payload, N, K, su, sv)
+        return HTCodec(payload, N, K, su, sv,
+                       bits=3 if variant == 0x1206 else 4)
     if store in (0, 1):
         return DenseCodec(payload, N, K, store)
     raise ValueError(f"store {store} not editable")
@@ -796,7 +845,36 @@ def parse_layer_spec(text):
     return spec
 
 
-def select_targets(hgn, layer_spec, only_re, skip_re, verbose=True):
+def select_targets(hgn, layer_spec, only_re, skip_re, verbose=True,
+                   writers=None):
+    if writers == "contract":
+        names = set(contract_writers(hgn))
+        targets = []
+        for e in hgn.entries:
+            if e.name not in names:
+                continue
+            if only_re and not only_re.search(e.name):
+                continue
+            if skip_re and skip_re.search(e.name):
+                continue
+            if not in_layer_spec(layer_of(e.name), layer_spec):
+                continue
+            if e.store not in EDITABLE_STORES:
+                if verbose:
+                    print(f"  skip {e.name}: store "
+                          f"{STORE_NAMES.get(e.store, e.store)} not editable")
+                continue
+            if e.store == 16 and e.variant not in (0x1208, 0x1206):
+                if verbose:
+                    print(f"  skip {e.name}: HT variant 0x{e.variant:04x} "
+                          f"not editable")
+                continue
+            if _out_axis_side(e) is None:
+                raise ValueError(
+                    f"{e.name}: contract writer shape {e.shape} has no "
+                    f"residual output axis")
+            targets.append(e)
+        return targets
     targets = []
     for e in hgn.entries:
         if EXCLUDE_RE.search(e.name):
@@ -819,10 +897,10 @@ def select_targets(hgn, layer_spec, only_re, skip_re, verbose=True):
                       f"not editable by this tool")
             continue
         if e.store == 16:
-            if e.variant != 0x1208:
+            if e.variant not in (0x1208, 0x1206):
                 if verbose:
                     print(f"  skip {e.name}: HT variant 0x{e.variant:04x} "
-                          f"(3-bit trellis) not editable")
+                          f"not editable")
                 continue
             if e.N % 128 or e.K % 128:
                 if verbose:
@@ -854,15 +932,101 @@ def transform_rows(w, r, alpha):
     return w
 
 
+def contract_writers(hgn):
+    """The pinned 149-writer abliteration contract (output-side matrices that
+    write the residual stream, plus embed_tokens). Returns the subset of
+    names present in this file. Matches the official ht43 tooling contract:
+    per layer the experts.down_proj, the dense out_proj (o_proj on every 4th
+    layer) and shared_expert.down_proj, plus the MTP head, embed_tokens and
+    layers.1.ple.value_proj."""
+    names = []
+    for layer in range(48):
+        names.append(f"layers.{layer}.mlp.experts.down_proj.weight")
+        dense = (f"layers.{layer}.self_attn.o_proj.weight"
+                 if layer % 4 == 3
+                 else f"layers.{layer}.linear_attn.out_proj.weight")
+        names.append(dense)
+        names.append(f"layers.{layer}.mlp.shared_expert.down_proj.weight")
+    names.extend([
+        "mtp.layers.0.self_attn.o_proj.weight",
+        "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+        "mtp.layers.0.mlp.experts.down_proj.weight",
+        "embed_tokens.weight",
+        "layers.1.ple.value_proj.weight",
+    ])
+    assert len(names) == 149 and len(set(names)) == 149
+    return [n for n in names if n in hgn.by_name]
+
+
+def _out_axis_side(e):
+    """Which axis of a contract writer holds the residual output features:
+    'last' for embed_tokens (each row IS a residual vector), 'rows' for
+    2-D writers (output index = row), 'experts' for fused down_proj
+    (output index = row % 2560)."""
+    if e.name == "embed_tokens.weight":
+        return "last"
+    if e.rank == 2 and e.N == RESIDUAL:
+        return "rows"
+    if e.rank == 3 and e.shape[1] == RESIDUAL:
+        return "experts"
+    return None
+
+
+def accumulate_cols(proj, w, r, mode, a):
+    """Accumulate proj += r^T W over a decoded row chunk [a:b) of a writer
+    whose output axis is the row axis. proj: (K,) for 'rows' mode or
+    (n_experts, K) for 'experts' mode; w: (rows, K) float32."""
+    out_idx = (np.arange(a, a + w.shape[0]) % RESIDUAL) if mode == "experts" \
+        else np.arange(a, a + w.shape[0])
+    contrib = r[out_idx][:, None] * w
+    if mode == "rows":
+        proj += contrib.sum(axis=0)
+    else:
+        np.add.at(proj, np.arange(a, a + w.shape[0]) // RESIDUAL, contrib)
+
+
+def ablate_out_axis(codec, e, r, alpha, chunk_rows):
+    """Writer-side ablation: remove the r component from the OUTPUT axis of
+    a contract writer so the refusal direction can never be written into
+    the residual stream. Single pass: chunks are chosen so every row whose
+    output index feeds a given accumulation is present in the same chunk
+    (2-D writers fit in one chunk; fused experts chunk expert-by-expert)."""
+    side = _out_axis_side(e)
+    if side == "last":
+        # embed_tokens: each row IS a residual vector
+        for a in range(0, e.N, chunk_rows):
+            b = min(a + chunk_rows, e.N)
+            w = codec.decode_rows(a, b)
+            transform_rows(w, r, alpha)
+            codec.encode_rows(a, b, w)
+    elif side == "rows":
+        # 2-D [2560, K]: proj = r^T W needs every output row at once
+        w = codec.decode_rows(0, e.N)
+        proj = r @ w
+        w -= np.float32(alpha) * r[:, None] * proj[None, :]
+        codec.encode_rows(0, e.N, w)
+    else:
+        # fused experts: rows are expert-major blocks of RESIDUAL rows
+        step = RESIDUAL * max(1, chunk_rows // RESIDUAL)
+        for a in range(0, e.N, step):
+            b = min(a + step, e.N)
+            w = codec.decode_rows(a, b)
+            W = w.reshape((b - a) // RESIDUAL, RESIDUAL, e.K)
+            proj = np.einsum("o,eok->ek", r, W)
+            W -= np.float32(alpha) * r[None, :, None] * proj[:, None, :]
+            codec.encode_rows(a, b, w)
+
+
 def abliterate(in_path, out_path, direction, alpha=1.0, layer_spec=None,
                only=None, skip=None, identity=None, verify=True,
-               chunk_rows=4096):
+               chunk_rows=4096, writers=None):
     hgn = HgnFile(in_path)
     r2560 = load_direction(direction)
     only_re = re.compile(only) if only else None
     skip_re = re.compile(skip) if skip else None
     print(f"input: {in_path}  identity={hgn.identity!r}  entries={len(hgn.entries)}")
-    targets = select_targets(hgn, layer_spec, only_re, skip_re)
+    targets = select_targets(hgn, layer_spec, only_re, skip_re,
+                             writers=writers)
     print(f"targets: {len(targets)} tensors")
     if not targets:
         raise ValueError(
@@ -900,13 +1064,17 @@ def abliterate(in_path, out_path, direction, alpha=1.0, layer_spec=None,
                                      f"(0x{got:08X} != 0x{e.checksum:08X})")
             codec = make_codec(e.store, e.variant, payload, e.N, e.K,
                                *(ht_sides(hgn, e) if e.store == 16 else (None, None)))
-            r = r2560 if e.K == RESIDUAL else np.tile(r2560, 4)
-            r = r / np.linalg.norm(r)  # tiled vector is not unit-norm
-            for a in range(0, e.N, chunk_rows):
-                b = min(a + chunk_rows, e.N)
-                w = codec.decode_rows(a, b)
-                transform_rows(w, r, alpha)
-                codec.encode_rows(a, b, w)
+            side = _out_axis_side(e) if writers == "contract" else None
+            if side is not None:
+                ablate_out_axis(codec, e, r2560, alpha, chunk_rows)
+            else:
+                r = r2560 if e.K == RESIDUAL else np.tile(r2560, 4)
+                r = r / np.linalg.norm(r)  # tiled vector is not unit-norm
+                for a in range(0, e.N, chunk_rows):
+                    b = min(a + chunk_rows, e.N)
+                    w = codec.decode_rows(a, b)
+                    transform_rows(w, r, alpha)
+                    codec.encode_rows(a, b, w)
             blob = codec.finalize()
             if len(blob) != e.size:
                 raise AssertionError(f"{e.name}: re-encoded size {len(blob)} "
@@ -1094,6 +1262,84 @@ def inspect(path, verify=False, name_filter=None):
 
 
 # ---------------------------------------------------------------------------
+# Direction derivation from a quantized pair
+
+def derive_direction(base_path, donor_path, out_path, chunk_rows=4096):
+    """Derive the refusal direction from a (base, already-abliterated) pair
+    by aggregating the output-axis Gram of dW across every contract writer.
+
+    The true edit is the same rank-1 r r^T in every writer, while the
+    requantization noise between two independently encoded quantized files
+    is independent per tensor. Summing dW dW^T over ~149 tensors therefore
+    raises the rank-1 dominance by roughly 149x over any single tensor --
+    a single quantized tensor's delta is noise-dominated (~0.03 dominance)
+    and yields a garbage direction.
+    """
+    base = HgnFile(base_path)
+    donor = HgnFile(donor_path)
+    names = [n for n in contract_writers(base) if n in donor.by_name]
+    G = np.zeros((RESIDUAL, RESIDUAL), np.float64)
+    used = 0
+    for name in names:
+        eb, ed = base.by_name[name], donor.by_name[name]
+        if eb.shape != ed.shape or eb.checksum == ed.checksum:
+            continue
+        if eb.store not in EDITABLE_STORES or ed.store not in EDITABLE_STORES:
+            print(f"  skip {name}: store not decodable")
+            continue
+        if eb.store == 16 and not (eb.variant in (0x1208, 0x1206)
+                                   and ed.variant in (0x1208, 0x1206)):
+            print(f"  skip {name}: HT variant not decodable")
+            continue
+        side = _out_axis_side(eb)
+        if side is None:
+            print(f"  skip {name}: no residual output axis")
+            continue
+        cb = make_codec(eb.store, eb.variant, base.payload(eb), eb.N, eb.K,
+                        *(ht_sides(base, eb) if eb.store == 16 else (None, None)))
+        cd = make_codec(ed.store, ed.variant, donor.payload(ed), ed.N, ed.K,
+                        *(ht_sides(donor, ed) if ed.store == 16 else (None, None)))
+        step = RESIDUAL * max(1, chunk_rows // RESIDUAL) \
+            if side == "experts" else chunk_rows
+        for a in range(0, eb.N, step):
+            b = min(a + step, eb.N)
+            d = cd.decode_rows(a, b) - cb.decode_rows(a, b)
+            if side == "last":
+                G += d.T @ d
+            elif side == "rows":
+                G += d @ d.T
+            else:
+                W = d.reshape((b - a) // RESIDUAL, RESIDUAL, eb.K)
+                G += np.einsum("eak,ebk->ab", W, W)
+            del d
+        used += 1
+        print(f"\r  writers: {used}/{len(names)}  {name}", end="", flush=True)
+    print()
+    trG = float(np.trace(G))
+    if not np.isfinite(trG) or trG <= 0:
+        raise ValueError("zero difference across the whole writer contract")
+    v = np.random.default_rng(0).standard_normal(RESIDUAL)
+    v /= np.linalg.norm(v)
+    for _ in range(1000):
+        prev = v
+        v = G @ v
+        v /= np.linalg.norm(v)
+        if abs(float(v @ prev)) > 1 - 1e-13:
+            break
+    eig = float(v @ (G @ v))
+    print(f"  top eigenvalue {eig:.3e}, trace {trG:.3e} "
+          f"(rank-1 dominance: {eig / trG:.3f})")
+    r = v.astype(np.float32)
+    r /= np.linalg.norm(r)
+    if r[int(np.argmax(np.abs(r)))] < 0:
+        r = -r
+    r.tofile(out_path)
+    print(f"wrote direction ({RESIDUAL} f32) to {out_path}")
+    base.close()
+    donor.close()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 
 def main(argv=None):
@@ -1113,6 +1359,16 @@ def main(argv=None):
     p.add_argument("--tensor", default="lm_head.weight")
     p.add_argument("--out", required=True, help="output .bin (f32) or .npy")
 
+    p = sub.add_parser(
+        "derive-direction",
+        help="derive the refusal direction from a base/abliterated pair by "
+             "noise-averaging dW over the whole writer contract (recommended "
+             "when both files are quantized)")
+    p.add_argument("--base", required=True, help="original .hgn")
+    p.add_argument("--donor", required=True, help="already-abliterated .hgn")
+    p.add_argument("--out", required=True, help="output .bin (f32)")
+    p.add_argument("--chunk-rows", type=int, default=4096)
+
     p = sub.add_parser("abliterate", help="apply orthogonalization")
     p.add_argument("input")
     p.add_argument("-o", "--output", required=True)
@@ -1122,6 +1378,11 @@ def main(argv=None):
                    help="extract the direction from a base/abliterated pair first")
     p.add_argument("--extract-tensor", default="lm_head.weight",
                    help="tensor used for --from-pair extraction")
+    p.add_argument("--writers", choices=("readers", "contract"),
+                   default="contract",
+                   help="contract: ablate the output axis of the official "
+                        "149-writer list (recommended); readers: legacy "
+                        "input-axis ablation of residual-reading matrices")
     p.add_argument("--alpha", type=float, default=1.0,
                    help="0..1, fraction of the refusal component to remove")
     p.add_argument("--layers", help='e.g. "20-47,mtp" (default: all)')
@@ -1137,6 +1398,9 @@ def main(argv=None):
         inspect(args.file, args.checksums, args.grep)
     elif args.cmd == "extract":
         extract(args.base, args.abliterated, args.tensor, args.out)
+    elif args.cmd == "derive-direction":
+        derive_direction(args.base, args.donor, args.out,
+                         chunk_rows=args.chunk_rows)
     elif args.cmd == "abliterate":
         direction = args.direction
         tmp = None
@@ -1145,14 +1409,19 @@ def main(argv=None):
             tmp = tempfile.NamedTemporaryFile(suffix=".f32", delete=False)
             tmp.close()
             direction = tmp.name
-            extract(args.from_pair[0], args.from_pair[1],
-                    args.extract_tensor, direction)
+            if args.writers == "contract":
+                derive_direction(args.from_pair[0], args.from_pair[1],
+                                 direction, chunk_rows=args.chunk_rows)
+            else:
+                extract(args.from_pair[0], args.from_pair[1],
+                        args.extract_tensor, direction)
         abliterate(
             args.input, args.output, direction,
             alpha=args.alpha,
             layer_spec=parse_layer_spec(args.layers) if args.layers else None,
             only=args.only, skip=args.skip, identity=args.identity,
             verify=not args.no_verify, chunk_rows=args.chunk_rows,
+            writers=args.writers,
         )
         if tmp:
             os.unlink(tmp.name)

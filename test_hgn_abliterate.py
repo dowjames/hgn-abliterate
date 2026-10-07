@@ -202,7 +202,7 @@ def main():
     rc = subprocess.run(
         [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                       "hgn_abliterate.py"), "abliterate",
-         base, "-o", out, "--direction", dirp],
+         base, "-o", out, "--direction", dirp, "--writers", "readers"],
         capture_output=True, text=True)
     print(rc.stdout + rc.stderr)
     assert rc.returncode == 0, "abliterate failed"
